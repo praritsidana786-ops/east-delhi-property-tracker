@@ -760,7 +760,7 @@ def run() -> int:
     today = datetime.now().strftime("%d %b %Y, %a")
     window_label = {72: "last 72h", 168: "last 7 days", 720: "last 30 days"}.get(used_window_h, f"last {used_window_h}h")
     header = (
-        f"<b>\ud83c\udfe0 East Delhi Property Tracker</b>\n"
+        f"<b>🏠 East Delhi Property Tracker</b>\n"
         f"<i>{today} \u00b7 \u20b95 Cr+ \u00b7 {window_label}</i>\n"
         f"<i>49 target areas</i>\n\n"
     )
@@ -783,10 +783,10 @@ def run() -> int:
         url = _html.escape(m.url[:250], quote=True)
         lines.append(
             f"<b>{i}. {_html.escape(m.matched_area)}</b>{bhk}\n"
-            f"\ud83d\udcb0 {price} \u00b7 {_html.escape(m.site)}\n"
-            f"\ud83c\udfe2 {title[:80]}\n"
-            f"\ud83d\udc64 {seller}  |  \ud83d\udcde {phone}\n"
-            f"\ud83d\udd17 <a href=\"{url}\">Open listing</a>\n"
+            f"💰 {price} \u00b7 {_html.escape(m.site)}\n"
+            f"🏢 {title[:80]}\n"
+            f"👤 {seller}  |  📞 {phone}\n"
+            f"🔗 <a href=\"{url}\">Open listing</a>\n"
         )
 
     if len(matched) > MAX_LISTINGS_PER_MESSAGE:
