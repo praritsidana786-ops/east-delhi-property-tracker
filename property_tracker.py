@@ -263,15 +263,17 @@ def scrape_99acres() -> list[Listing]:
     """99acres - worked reliably in v1. Added 5Cr budget filter."""
     out: list[Listing] = []
     url = "https://www.99acres.com/property-in-east-delhi-ffid-buy?budget_min=300&budget_type=L&sort=date_new_to_old"
-    html_text = playwright_fetch(url, wait_selector='[class*="tupleNew"], [class*="SrpCard"]')
+    # 99acres blocks Playwright (Cloudflare). Use requests first which works reliably.
+    r = fetch(url)
+    html_text = r.text if r else None
     if not html_text or len(html_text) < 5000:
-        log.info("99acres: Playwright got %s chars, using requests", len(html_text) if html_text else 0)
-        r = fetch(url)
-        if not r:
+        log.info("99acres: requests got %s chars, trying Playwright", len(html_text) if html_text else 0)
+        html_text = playwright_fetch(url, wait_selector='[class*="tupleNew"], [class*="SrpCard"]')
+        if not html_text or len(html_text) < 5000:
             return out
-        html_text = r.text
+        log.info("99acres: Playwright fallback %d chars", len(html_text))
     else:
-        log.info("99acres: Playwright rendered %d chars", len(html_text))
+        log.info("99acres: requests %d chars", len(html_text))
 
     soup = BeautifulSoup(html_text, "html.parser")
 
