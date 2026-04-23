@@ -37,7 +37,7 @@ from bs4 import BeautifulSoup
 # CONFIGURATION
 # ---------------------------------------------------------------------------
 
-MIN_PRICE_INR = 50_000_000        # 5 Crore
+MIN_PRICE_INR = 30_000_000        # 5 Crore
 TARGET_MIN_LISTINGS = 10           # min listings to include in digest
 FALLBACK_WINDOWS_H = [72, 168, 720]  # 3d, 7d, 30d
 MAX_LISTINGS_PER_MESSAGE = 40
@@ -230,12 +230,18 @@ def fetch(url: str, headers: dict | None = None, timeout: int = 30) -> requests.
 def scrape_99acres() -> list[Listing]:
     """99acres - worked reliably in v1. Added 5Cr budget filter."""
     out: list[Listing] = []
-    url = "https://www.99acres.com/property-in-east-delhi-ffid-buy?budget_min=500&budget_type=L&sort=date_new_to_old"
-    r = fetch(url)
-    if not r:
-        return out
+    url = "https://www.99acres.com/property-in-east-delhi-ffid-buy?budget_min=300&budget_type=L&sort=date_new_to_old"
+    html_text = playwright_fetch(url, wait_selector='[class*="tupleNew"], [class*="SrpCard"]')
+    if not html_text or len(html_text) < 5000:
+        log.info("99acres: Playwright got %s chars, using requests", len(html_text) if html_text else 0)
+        r = fetch(url)
+        if not r:
+            return out
+        html_text = r.text
+    else:
+        log.info("99acres: Playwright rendered %d chars", len(html_text))
 
-    soup = BeautifulSoup(r.text, "html.parser")
+    soup = BeautifulSoup(html_text, "html.parser")
 
     # Extract listing divs - pattern: div with image + price + BHK text
     # Find leaf cards by scoring.
@@ -309,15 +315,24 @@ def scrape_magicbricks() -> list[Listing]:
         "https://www.magicbricks.com/property-for-sale-in-east-delhi-pppfs",
         "https://www.magicbricks.com/property-for-sale/in/east-delhi",
     ]
+    html_text = None
+    chosen = None
     for url in url_candidates:
+        h = playwright_fetch(url, wait_selector='[class*="srp__card"], [class*="mb-srp"]')
+        if h and len(h) > 10000:
+            html_text = h; chosen = url
+            log.info("MagicBricks (playwright): %s", url[:80])
+            break
         r = fetch(url)
         if r and r.status_code == 200 and len(r.text) > 5000:
-            log.info("MagicBricks: using %s", url[:80])
+            html_text = r.text; chosen = url
+            log.info("MagicBricks (simple): %s", url[:80])
             break
-    else:
+    if not html_text:
         return out
+    url = chosen
 
-    soup = BeautifulSoup(r.text, "html.parser")
+    soup = BeautifulSoup(html_text, "html.parser")
     cards = soup.select("div.mb-srp__card") or soup.select("[class*=srp__card]") or soup.find_all("div", class_=re.compile(r"card|tuple|listing", re.I))
 
     for c in cards[:200]:
@@ -730,17 +745,16 @@ def run() -> int:
     for i, m in enumerate(matched[:MAX_LISTINGS_PER_MESSAGE], 1):
         price = _html.escape(m.price_display or format_inr(m.price_inr or 0))
         bhk = f" \u00b7 {_html.escape(m.bhk)}" if m.bhk else ""
-        seller = _html.escape(m.seller_name) if m.seller_name else "<i>Not listed</i>"
-        phone = _html.escape(m.seller_phone) if m.seller_phone else "<i>Login required on site</i>"
+        seller = _html.escape(m.seller_name) if m.seller_name else "Not listed"
+        phone = _html.escape(m.seller_phone) if m.seller_phone else "Login required"
         title = _html.escape((m.title or "Property")[:100])
         url = _html.escape(m.url[:250], quote=True)
         lines.append(
-            f"<b>{i}.</b> \ud83d\udccd <b>{_html.escape(m.matched_area)}</b>{bhk} \u00b7 <i>{_html.escape(m.site)}</i>\n"
-            f"   \ud83d\udcb0 <b>{price}</b>\n"
-            f"   \ud83c\udfe2 {title[:80]}\n"
-            f"   \ud83d\udc64 Seller: {seller}\n"
-            f"   \ud83d\udcde Phone: {phone}\n"
-            f"   \ud83d\udd17 <a href=\"{url}\">View listing</a>\n"
+            f"<b>{i}. {_html.escape(m.matched_area)}</b>{bhk}\n"
+            f"\ud83d\udcb0 {price} \u00b7 {_html.escape(m.site)}\n"
+            f"\ud83c\udfe2 {title[:80]}\n"
+            f"\ud83d\udc64 {seller}  |  \ud83d\udcde {phone}\n"
+            f"\ud83d\udd17 <a href=\"{url}\">Open listing</a>\n"
         )
 
     if len(matched) > MAX_LISTINGS_PER_MESSAGE:
