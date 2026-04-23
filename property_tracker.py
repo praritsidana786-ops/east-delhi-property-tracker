@@ -262,7 +262,8 @@ def scrape_99acres() -> list[Listing]:
         if not area: continue
 
         bhk_m = re.search(r"(\d+)\s*BHK", text, re.I)
-        type_m = re.search(r"(\d+\s*BHK\s+(?:Flat|Apartment|Builder Floor|Villa|House|Plot))", text, re.I) \              or re.search(r"(Plot|Land|House|Villa)\s+in", text, re.I)
+        type_m = re.search(r"(\d+\s*BHK\s+(?:Flat|Apartment|Builder Floor|Villa|House|Plot))", text, re.I) \
+              or re.search(r"(Plot|Land|House|Villa)\s+in", text, re.I)
         age_m = re.search(r"(\d+\s*(?:d|day|days|w|week|weeks|mo|month|months|h|hr|hours)\s+ago|Today|Yesterday|Just Now)", text, re.I)
         # seller / dealer name - 99acres shows "Dealer - XYZ" or "Posted by XYZ"
         seller_m = re.search(r"(?:Dealer|Owner|Posted by|Agent)[\s:-]+([A-Z][A-Za-z0-9 .&()]{2,40})", text)
