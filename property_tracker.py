@@ -1,21 +1,19 @@
 """
-East Delhi Property Tracker
-===========================
+East Delhi Property Tracker (v2)
+================================
 
-Scrapes property listings posted in the last 72 hours from multiple sites,
-filters by target East Delhi areas and a minimum price, and posts a digest
-to Telegram.
+Daily digest of new property listings in 49 East Delhi target areas,
+priced at Rs 5 Crore or more. Posted to Telegram at 7:00 AM IST.
 
-Designed to run daily via GitHub Actions at 7:00 AM IST.
-
-Environment variables (set as GitHub Actions secrets):
-    TELEGRAM_BOT_TOKEN  - Your Telegram bot token from BotFather
-    TELEGRAM_CHAT_ID    - Chat ID where alerts should be posted
-
-Output:
-    - Posts digest to Telegram
-    - Writes `seen_listings.json` (deduplicated listing IDs) - persisted via
-      GitHub Actions cache so the same listing is not reported twice.
+Changes in v2:
+- MIN_PRICE: 5 Crore (up from 1 Cr)
+- Digest now includes S.N., seller name (when public), phone (marked
+  "Login to view" when hidden behind the site's auth wall - which is
+  the honest truth for 99acres / MagicBricks / Housing / NoBroker).
+- Sliding-window fallback: if < 10 matches in 72h, widen to 7d, then 30d.
+- Updated site list: magicbricks, 99acres, housing.com, nobroker,
+  propertywala, dreamproperty.net.in.
+- Fixed URL patterns that returned 404 in v1.
 """
 
 from __future__ import annotations
@@ -26,10 +24,10 @@ import os
 import re
 import sys
 import time
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable
 
 import requests
 from bs4 import BeautifulSoup
@@ -38,12 +36,11 @@ from bs4 import BeautifulSoup
 # CONFIGURATION
 # ---------------------------------------------------------------------------
 
-MIN_PRICE_INR = 10_000_000        # 1 Crore
-HOURS_WINDOW = 72                 # Only listings posted within this window
-MAX_LISTINGS_PER_MESSAGE = 40     # Telegram message cap
+MIN_PRICE_INR = 50_000_000        # 5 Crore
+TARGET_MIN_LISTINGS = 10           # min listings to include in digest
+FALLBACK_WINDOWS_H = [72, 168, 720]  # 3d, 7d, 30d
+MAX_LISTINGS_PER_MESSAGE = 40
 
-# 49 East Delhi target areas (from screenshots).
-# Spelling variants included to maximise matches across sites.
 TARGET_AREAS: list[tuple[str, list[str]]] = [
     ("Dayanand Vihar",           ["dayanand vihar"]),
     ("Hargobind Enclave",        ["hargobind enclave", "hari gobind enclave"]),
@@ -61,7 +58,7 @@ TARGET_AREAS: list[tuple[str, list[str]]] = [
     ("Pushpanjali",              ["pushpanjali"]),
     ("Surya Niketan",            ["surya niketan"]),
     ("Ram Vihar",                ["ram vihar"]),
-    ("Surajmal Vihar",           ["surajmal vihar", "suraj mal vihar", "teachers colony"]),
+    ("Surajmal Vihar",           ["surajmal vihar", "suraj mal vihar"]),
     ("Vigyan Vihar",             ["vigyan vihar"]),
     ("Yojna Vihar",              ["yojna vihar", "yojana vihar"]),
     ("Savita Vihar",             ["savita vihar"]),
@@ -77,7 +74,7 @@ TARGET_AREAS: list[tuple[str, list[str]]] = [
     ("Nirman Vihar",             ["nirman vihar"]),
     ("Madhuban Enclave",         ["madhuban enclave"]),
     ("Preet Vihar",              ["preet vihar"]),
-    ("Dayal Enclave (Bharti)",   ["dayal enclave", "bharti enclave", "bharti apartment"]),
+    ("Dayal Enclave",            ["dayal enclave", "bharti enclave", "bharti apartment"]),
     ("Shankar Vihar",            ["shankar vihar"]),
     ("Swasthya Vihar",           ["swasthya vihar", "svasthya vihar"]),
     ("Gujrat Vihar",             ["gujrat vihar", "gujarat vihar"]),
@@ -96,7 +93,6 @@ TARGET_AREAS: list[tuple[str, list[str]]] = [
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-
 SEEN_FILE = Path("seen_listings.json")
 
 COMMON_HEADERS = {
@@ -136,18 +132,12 @@ class Listing:
     posted_at: datetime | None = None
     property_type: str = ""
     bhk: str = ""
-    area_sqft: str = ""
-    contact: str = ""
+    seller_name: str = ""
+    seller_phone: str = ""
     matched_area: str = ""
 
     def unique_key(self) -> str:
         return f"{self.site}::{self.listing_id}"
-
-    def serialise(self) -> dict:
-        d = asdict(self)
-        if self.posted_at:
-            d["posted_at"] = self.posted_at.isoformat()
-        return d
 
 
 # ---------------------------------------------------------------------------
@@ -155,457 +145,517 @@ class Listing:
 # ---------------------------------------------------------------------------
 
 def parse_price_to_inr(text: str) -> int | None:
-    """Parse strings like '1.25 Cr', '₹ 95 Lakh', '1,25,00,000' to integer rupees."""
     if not text:
         return None
-    s = text.replace(",", "").replace("₹", "").replace("INR", "").strip().lower()
-    # Match number + optional unit
+    s = text.replace(",", "").replace("\u20b9", "").replace("INR", "").strip().lower()
     m = re.search(r"(\d+(?:\.\d+)?)\s*(cr|crore|lakh|lac|k|l)?", s)
     if not m:
         return None
     try:
-        value = float(m.group(1))
-        unit = (m.group(2) or "").lower()
-        if unit in ("cr", "crore"):
-            return int(value * 10_000_000)
-        if unit in ("lakh", "lac", "l"):
-            return int(value * 100_000)
-        if unit == "k":
-            return int(value * 1_000)
-        # Raw number - infer based on magnitude
-        if value >= 100_000:
-            return int(value)
-        # assume it's in lakhs if smaller
-        return int(value * 100_000)
-    except (ValueError, TypeError):
+        v = float(m.group(1))
+        u = (m.group(2) or "").lower()
+        if u in ("cr", "crore"): return int(v * 10_000_000)
+        if u in ("lakh", "lac", "l"): return int(v * 100_000)
+        if u == "k": return int(v * 1_000)
+        if v >= 100_000: return int(v)
+        return int(v * 100_000)
+    except Exception:
         return None
 
 
 def format_inr(amount: int) -> str:
     if amount >= 10_000_000:
-        return f"₹{amount / 10_000_000:.2f} Cr"
+        return f"\u20b9{amount/10_000_000:.2f} Cr"
     if amount >= 100_000:
-        return f"₹{amount / 100_000:.2f} Lakh"
-    return f"₹{amount:,}"
+        return f"\u20b9{amount/100_000:.2f} Lakh"
+    return f"\u20b9{amount:,}"
 
 
-def match_target_area(location_text: str) -> str | None:
-    """Return the canonical area name if the listing's location matches any target."""
-    if not location_text:
-        return None
-    haystack = location_text.lower()
+def match_target_area(text: str) -> str | None:
+    if not text: return None
+    lo = text.lower()
     for canonical, variants in TARGET_AREAS:
-        for v in variants:
-            if v in haystack:
-                return canonical
+        if any(v in lo for v in variants):
+            return canonical
     return None
 
 
-def within_window(posted: datetime | None) -> bool:
-    """True if posted_at falls within HOURS_WINDOW. Unknown dates pass through."""
-    if posted is None:
-        return True  # be lenient - include if we can't verify
+def parse_age_to_hours(age_text: str) -> int | None:
+    """Convert '6d ago', '2w ago', '1mo ago', 'Today' to hours-old."""
+    if not age_text: return None
+    s = age_text.lower().strip()
+    if "today" in s or "just now" in s or "few hours" in s: return 1
+    if "yesterday" in s: return 24
+    m = re.search(r"(\d+)\s*(h|hr|hour|hours|d|day|days|w|week|weeks|mo|month|months|y|yr|year|years)", s)
+    if not m: return None
+    n = int(m.group(1))
+    u = m.group(2)
+    if u.startswith("h"): return n
+    if u.startswith("d"): return n * 24
+    if u.startswith("w"): return n * 24 * 7
+    if u.startswith("mo") or u == "m": return n * 24 * 30
+    if u.startswith("y"): return n * 24 * 365
+    return None
+
+
+def within_window(posted: datetime | None, hours: int) -> bool:
+    if posted is None: return True
     now = datetime.now(timezone.utc)
     if posted.tzinfo is None:
         posted = posted.replace(tzinfo=timezone.utc)
-    return (now - posted) <= timedelta(hours=HOURS_WINDOW)
+    return (now - posted) <= timedelta(hours=hours)
 
 
-def fetch(url: str, params: dict | None = None, timeout: int = 30) -> requests.Response | None:
-    """HTTP GET with standard headers and light retry."""
+def fetch(url: str, headers: dict | None = None, timeout: int = 30) -> requests.Response | None:
+    hdrs = {**COMMON_HEADERS, **(headers or {})}
     for attempt in range(3):
         try:
-            r = requests.get(url, params=params, headers=COMMON_HEADERS, timeout=timeout)
+            r = requests.get(url, headers=hdrs, timeout=timeout, allow_redirects=True)
             if r.status_code == 200:
                 return r
-            log.warning("GET %s -> %s (attempt %d)", url, r.status_code, attempt + 1)
+            log.warning("GET %s -> %s (try %d)", url[:100], r.status_code, attempt + 1)
         except requests.RequestException as e:
-            log.warning("GET %s failed: %s", url, e)
-        time.sleep(2 * (attempt + 1))
+            log.warning("GET %s failed: %s", url[:100], str(e)[:100])
+        time.sleep(1.5 * (attempt + 1))
     return None
 
 
 # ---------------------------------------------------------------------------
 # SITE SCRAPERS
-# Each scraper returns List[Listing]. Errors are caught in main() so one
-# site's failure doesn't kill the run.
+# Each returns List[Listing]. Each tries MULTIPLE URL patterns since these
+# sites rotate URLs frequently.
 # ---------------------------------------------------------------------------
 
-def scrape_magicbricks() -> list[Listing]:
-    """
-    MagicBricks: uses their property-for-sale search pages for East Delhi.
-    We iterate target localities and parse listing cards.
-    """
-    listings: list[Listing] = []
-    base = "https://www.magicbricks.com/property-for-sale-in-east-delhi-pppfs"
-    r = fetch(base)
-    if not r:
-        return listings
-
-    soup = BeautifulSoup(r.text, "html.parser")
-    cards = soup.select("div.mb-srp__card") or soup.select("[class*=srp__card]")
-    for c in cards:
-        try:
-            title_el = c.select_one("[class*=title]") or c.select_one("h2")
-            title = title_el.get_text(" ", strip=True) if title_el else ""
-            loc_el = c.select_one("[class*=society]") or c.select_one("[class*=locality]")
-            location = loc_el.get_text(" ", strip=True) if loc_el else title
-            price_el = c.select_one("[class*=price]")
-            price_txt = price_el.get_text(" ", strip=True) if price_el else ""
-            link = c.select_one("a[href]")
-            href = link["href"] if link else base
-            if href.startswith("/"):
-                href = "https://www.magicbricks.com" + href
-            lid = re.search(r"(\d{6,})", href)
-            listings.append(Listing(
-                site="MagicBricks",
-                listing_id=lid.group(1) if lid else href[-40:],
-                title=title,
-                location=location,
-                url=href,
-                price_inr=parse_price_to_inr(price_txt),
-                price_display=price_txt,
-                posted_at=None,  # MagicBricks hides exact post dates on listing card
-            ))
-        except Exception as e:
-            log.debug("MagicBricks card parse error: %s", e)
-    log.info("MagicBricks: %d raw listings", len(listings))
-    return listings
-
-
 def scrape_99acres() -> list[Listing]:
-    """99acres: east delhi residential for sale."""
-    listings: list[Listing] = []
-    url = "https://www.99acres.com/property-in-east-delhi-ffid"
+    """99acres - worked reliably in v1. Added 5Cr budget filter."""
+    out: list[Listing] = []
+    url = "https://www.99acres.com/property-in-east-delhi-ffid-buy?budget_min=500&budget_type=L&sort=date_new_to_old"
     r = fetch(url)
     if not r:
-        return listings
+        return out
+
     soup = BeautifulSoup(r.text, "html.parser")
 
-    # 99acres injects listing data in a JSON blob in a script tag.
-    # Fallback to HTML parsing if not found.
-    script = soup.find("script", id="__NEXT_DATA__") or soup.find(
-        "script", string=re.compile(r"window\.__NUXT__|__INITIAL_STATE__")
-    )
+    # Extract listing divs - pattern: div with image + price + BHK text
+    # Find leaf cards by scoring.
+    for c in soup.find_all("div"):
+        txt = c.get_text(" ", strip=True) or ""
+        if len(txt) < 100 or len(txt) > 800: continue
+        if "\u20b9" not in txt: continue
+        if not re.search(r"(BHK|Plot|Floor|Villa|House)", txt, re.I): continue
+        # only leaf-ish cards (avoid big containers)
+        child_price_hits = sum(
+            1 for d in c.find_all("div")
+            if d is not c and 80 < len(d.get_text(" ", strip=True) or "") < 800
+            and "\u20b9" in (d.get_text(" ", strip=True) or "")
+        )
+        if child_price_hits > 1: continue
+
+        text = re.sub(r"\s+", " ", txt)
+        price_m = re.search(r"\u20b9\s*([\d.]+)\s*(Cr|Lac|Lakh)", text, re.I)
+        if not price_m: continue
+        price_val = float(price_m.group(1))
+        price_inr = int(price_val * 10_000_000) if price_m.group(2).lower().startswith("c") else int(price_val * 100_000)
+        if price_inr < MIN_PRICE_INR: continue
+
+        area = match_target_area(text)
+        if not area: continue
+
+        bhk_m = re.search(r"(\d+)\s*BHK", text, re.I)
+        type_m = re.search(r"(\d+\s*BHK\s+(?:Flat|Apartment|Builder Floor|Villa|House|Plot))", text, re.I) \              or re.search(r"(Plot|Land|House|Villa)\s+in", text, re.I)
+        age_m = re.search(r"(\d+\s*(?:d|day|days|w|week|weeks|mo|month|months|h|hr|hours)\s+ago|Today|Yesterday|Just Now)", text, re.I)
+        # seller / dealer name - 99acres shows "Dealer - XYZ" or "Posted by XYZ"
+        seller_m = re.search(r"(?:Dealer|Owner|Posted by|Agent)[\s:-]+([A-Z][A-Za-z0-9 .&()]{2,40})", text)
+
+        # build a unique-ish key
+        key_seed = f"{area}::{price_m.group(0)}::{bhk_m.group(0) if bhk_m else ''}::{text[:80]}"
+        listing_id = str(abs(hash(key_seed)))[:12]
+
+        hours = parse_age_to_hours(age_m.group(0) if age_m else "")
+        posted = datetime.now(timezone.utc) - timedelta(hours=hours) if hours else None
+
+        out.append(Listing(
+            site="99acres",
+            listing_id=listing_id,
+            title=(type_m.group(0) if type_m else bhk_m.group(0) if bhk_m else "Property")[:80],
+            location=area,
+            url=url,
+            price_inr=price_inr,
+            price_display=price_m.group(0),
+            posted_at=posted,
+            bhk=bhk_m.group(0) if bhk_m else "",
+            seller_name=seller_m.group(1).strip() if seller_m else "",
+            seller_phone="",  # always hidden behind login
+            matched_area=area,
+        ))
+
+    # dedupe
+    seen = set(); unique = []
+    for l in out:
+        k = (l.matched_area, l.price_display, l.bhk, l.title)
+        if k in seen: continue
+        seen.add(k); unique.append(l)
+    log.info("99acres: %d matched", len(unique))
+    return unique
+
+
+def scrape_magicbricks() -> list[Listing]:
+    """MagicBricks - try multiple URL patterns since v1 got 404."""
+    out: list[Listing] = []
+    url_candidates = [
+        "https://www.magicbricks.com/property-for-sale/residential-real-estate?bedroom=&proptype=Multistorey-Apartment,Builder-Floor-Apartment,Penthouse,Residential-House,Villa,Residential-Plot&cityName=New-Delhi",
+        "https://www.magicbricks.com/property-for-sale-in-east-delhi-pppfs",
+        "https://www.magicbricks.com/property-for-sale/in/east-delhi",
+    ]
+    for url in url_candidates:
+        r = fetch(url)
+        if r and r.status_code == 200 and len(r.text) > 5000:
+            log.info("MagicBricks: using %s", url[:80])
+            break
+    else:
+        return out
+
+    soup = BeautifulSoup(r.text, "html.parser")
+    cards = soup.select("div.mb-srp__card") or soup.select("[class*=srp__card]") or soup.find_all("div", class_=re.compile(r"card|tuple|listing", re.I))
+
+    for c in cards[:200]:
+        try:
+            txt = c.get_text(" ", strip=True) or ""
+            if "\u20b9" not in txt: continue
+            text = re.sub(r"\s+", " ", txt)
+            price_m = re.search(r"\u20b9\s*([\d.]+)\s*(Cr|Lac|Lakh)", text, re.I)
+            if not price_m: continue
+            price_val = float(price_m.group(1))
+            price_inr = int(price_val * 10_000_000) if price_m.group(2).lower().startswith("c") else int(price_val * 100_000)
+            if price_inr < MIN_PRICE_INR: continue
+
+            area = match_target_area(text)
+            if not area: continue
+
+            bhk_m = re.search(r"(\d+)\s*BHK", text, re.I)
+            age_m = re.search(r"(\d+\s*(?:d|day|days|w|week|weeks|mo|month|months|h|hr|hours)\s+ago|Today|Yesterday)", text, re.I)
+            seller_m = re.search(r"(?:Dealer|Owner|Posted by|By)[\s:-]+([A-Z][A-Za-z0-9 .&()]{2,40})", text)
+
+            link = c.select_one("a[href]")
+            href = link["href"] if link else url
+            if href.startswith("/"): href = "https://www.magicbricks.com" + href
+            lid = re.search(r"(\d{6,})", href)
+
+            hours = parse_age_to_hours(age_m.group(0) if age_m else "")
+            posted = datetime.now(timezone.utc) - timedelta(hours=hours) if hours else None
+
+            out.append(Listing(
+                site="MagicBricks",
+                listing_id=lid.group(1) if lid else str(abs(hash(text[:80])))[:12],
+                title=text[:100],
+                location=area,
+                url=href,
+                price_inr=price_inr,
+                price_display=price_m.group(0),
+                posted_at=posted,
+                bhk=bhk_m.group(0) if bhk_m else "",
+                seller_name=seller_m.group(1).strip() if seller_m else "",
+                matched_area=area,
+            ))
+        except Exception:
+            continue
+    log.info("MagicBricks: %d matched", len(out))
+    return out
+
+
+def scrape_housing() -> list[Listing]:
+    """Housing.com - new site added in v2."""
+    out: list[Listing] = []
+    url_candidates = [
+        "https://housing.com/in/buy/real-estate/delhi-central/east-delhi",
+        "https://housing.com/in/buy/real-estate/east-delhi",
+        "https://housing.com/in/buy/searches/east-delhi-residential",
+    ]
+    r = None
+    for url in url_candidates:
+        r = fetch(url, headers={"Accept": "text/html,*/*"})
+        if r and r.status_code == 200 and len(r.text) > 5000:
+            log.info("Housing: using %s", url[:80])
+            break
+    if not r or r.status_code != 200:
+        return out
+
+    soup = BeautifulSoup(r.text, "html.parser")
+    # Housing.com uses data-q- attributes and React
+    # Try NEXT_DATA first
+    script = soup.find("script", id="__NEXT_DATA__")
     if script and script.string:
         try:
-            data = json.loads(script.string) if script.get("id") == "__NEXT_DATA__" else None
-            # Best-effort extraction - structure varies; user may need to update selectors.
-            if data:
-                # The actual JSON path differs by release; we traverse generically.
-                def walk(node):
-                    if isinstance(node, dict):
-                        if "propertyId" in node and "propertyTitle" in node:
-                            yield node
-                        for v in node.values():
-                            yield from walk(v)
-                    elif isinstance(node, list):
-                        for v in node:
-                            yield from walk(v)
-                for item in walk(data):
-                    try:
-                        lid = str(item.get("propertyId", ""))
-                        listings.append(Listing(
-                            site="99acres",
-                            listing_id=lid,
-                            title=item.get("propertyTitle", ""),
-                            location=item.get("localityName", "") or item.get("cityName", ""),
-                            url=f"https://www.99acres.com/p/{lid}",
-                            price_inr=parse_price_to_inr(str(item.get("price", ""))),
-                            price_display=str(item.get("priceDisplay", item.get("price", ""))),
-                            posted_at=None,
-                            bhk=str(item.get("bedrooms", "")),
-                            property_type=item.get("propertyType", ""),
-                        ))
-                    except Exception:
-                        continue
+            data = json.loads(script.string)
+            def walk(node):
+                if isinstance(node, dict):
+                    if ("price" in node or "displayPrice" in node) and ("title" in node or "name" in node):
+                        yield node
+                    for v in node.values():
+                        yield from walk(v)
+                elif isinstance(node, list):
+                    for v in node:
+                        yield from walk(v)
+            for item in walk(data):
+                try:
+                    title = str(item.get("title") or item.get("name") or "")[:150]
+                    location = str(item.get("locality") or item.get("localityName") or item.get("locationName") or title)
+                    price_raw = item.get("price") or item.get("displayPrice") or ""
+                    price_inr = parse_price_to_inr(str(price_raw)) if isinstance(price_raw, str) else (int(price_raw) if isinstance(price_raw, (int, float)) else None)
+                    if not price_inr or price_inr < MIN_PRICE_INR: continue
+                    area = match_target_area(f"{title} {location}")
+                    if not area: continue
+                    lid = str(item.get("id") or item.get("propertyId") or abs(hash(title))%10**12)[:15]
+                    out.append(Listing(
+                        site="Housing",
+                        listing_id=lid,
+                        title=title,
+                        location=location,
+                        url=item.get("url") or url,
+                        price_inr=price_inr,
+                        price_display=format_inr(price_inr),
+                        bhk=str(item.get("bedrooms") or item.get("bhk") or ""),
+                        seller_name=str(item.get("postedBy") or item.get("ownerName") or ""),
+                        matched_area=area,
+                    ))
+                except Exception:
+                    continue
         except Exception as e:
-            log.debug("99acres JSON parse error: %s", e)
+            log.debug("Housing NEXT_DATA parse: %s", e)
 
     # HTML fallback
-    if not listings:
-        for c in soup.select("[class*=SrpCard] , [class*=tupleNew]"):
-            try:
-                title_el = c.select_one("[class*=title]") or c.find("h2")
-                price_el = c.select_one("[class*=price]")
-                link = c.select_one("a[href]")
-                href = link["href"] if link else url
-                if href.startswith("/"):
-                    href = "https://www.99acres.com" + href
-                lid = re.search(r"(\d{6,})", href)
-                listings.append(Listing(
-                    site="99acres",
-                    listing_id=lid.group(1) if lid else href[-40:],
-                    title=title_el.get_text(" ", strip=True) if title_el else "",
-                    location=title_el.get_text(" ", strip=True) if title_el else "",
-                    url=href,
-                    price_display=price_el.get_text(" ", strip=True) if price_el else "",
-                    price_inr=parse_price_to_inr(price_el.get_text() if price_el else ""),
-                ))
-            except Exception:
-                continue
-    log.info("99acres: %d raw listings", len(listings))
-    return listings
+    if not out:
+        for c in soup.find_all("div"):
+            txt = c.get_text(" ", strip=True) or ""
+            if len(txt) < 100 or len(txt) > 600 or "\u20b9" not in txt: continue
+            text = re.sub(r"\s+", " ", txt)
+            price_m = re.search(r"\u20b9\s*([\d.]+)\s*(Cr|Lac|Lakh)", text, re.I)
+            if not price_m: continue
+            price_inr = int(float(price_m.group(1)) * (10_000_000 if price_m.group(2).lower().startswith("c") else 100_000))
+            if price_inr < MIN_PRICE_INR: continue
+            area = match_target_area(text)
+            if not area: continue
+            bhk_m = re.search(r"(\d+)\s*BHK", text, re.I)
+            out.append(Listing(
+                site="Housing",
+                listing_id=str(abs(hash(text[:80])))[:12],
+                title=text[:100],
+                location=area,
+                url=url,
+                price_inr=price_inr,
+                price_display=price_m.group(0),
+                bhk=bhk_m.group(0) if bhk_m else "",
+                matched_area=area,
+            ))
+    log.info("Housing: %d matched", len(out))
+    return out
 
 
 def scrape_nobroker() -> list[Listing]:
-    """NoBroker: has a public JSON API for property search."""
-    listings: list[Listing] = []
-    # NoBroker API: east delhi sale properties
-    api = "https://www.nobroker.in/api/v3/multi/property/sale"
-    params = {
-        "city": "delhi",
-        "searchParam": "[{\"lat\":28.6421,\"lon\":77.3065,\"placeId\":\"ChIJ_____9_EDTkR\",\"placeName\":\"East Delhi\"}]",
-        "pageNo": "1",
-        "type": "BHK2,BHK3,BHK4,BHK4PLUS,1RK1,BHK1",
-    }
-    try:
-        r = requests.get(api, params=params, headers={
-            **COMMON_HEADERS,
-            "Accept": "application/json",
-            "Referer": "https://www.nobroker.in/",
-        }, timeout=30)
-        if r.status_code != 200:
-            log.warning("NoBroker API %s", r.status_code)
-            return listings
-        data = r.json()
-        items = data.get("data", []) or data.get("properties", [])
-        for it in items:
-            try:
-                lid = str(it.get("id") or it.get("propertyId", ""))
-                listings.append(Listing(
-                    site="NoBroker",
-                    listing_id=lid,
-                    title=it.get("title", "") or it.get("propertyTitle", ""),
-                    location=" ".join(filter(None, [
-                        it.get("societyName", ""),
-                        it.get("localityName", ""),
-                        it.get("locality", ""),
-                    ])),
-                    url=f"https://www.nobroker.in/property/{lid}",
-                    price_inr=int(it.get("price") or 0) or None,
-                    price_display=format_inr(int(it.get("price") or 0)) if it.get("price") else "",
-                    posted_at=_parse_iso(it.get("activationDate") or it.get("createdDate")),
-                    bhk=str(it.get("type", "")),
-                ))
-            except Exception as e:
-                log.debug("NoBroker item parse: %s", e)
-    except Exception as e:
-        log.warning("NoBroker error: %s", e)
-    log.info("NoBroker: %d raw listings", len(listings))
-    return listings
-
-
-def scrape_squareyards() -> list[Listing]:
-    """SquareYards East Delhi residential for sale."""
-    listings: list[Listing] = []
-    url = "https://www.squareyards.com/sale/property-for-sale-in-east-delhi"
-    r = fetch(url)
-    if not r:
-        return listings
-    soup = BeautifulSoup(r.text, "html.parser")
-    for c in soup.select(".npd-info-box, .listing-card, [class*=property-item]"):
+    """NoBroker - try their newer API paths."""
+    out: list[Listing] = []
+    apis = [
+        "https://www.nobroker.in/api/v3/multi/property/filter?city=delhi&type=SALE&lat=28.6421&lon=77.3065",
+        "https://www.nobroker.in/api/v1/services/property/filter?city=delhi&type=SALE",
+    ]
+    for api in apis:
         try:
-            title_el = c.select_one("h2, h3, .property-title")
-            loc_el = c.select_one("[class*=location], [class*=address]")
-            price_el = c.select_one("[class*=price]")
-            link = c.select_one("a[href]")
-            href = link["href"] if link else url
-            if href.startswith("/"):
-                href = "https://www.squareyards.com" + href
-            lid = re.search(r"(\d{5,})", href)
-            listings.append(Listing(
-                site="SquareYards",
-                listing_id=lid.group(1) if lid else href[-40:],
-                title=title_el.get_text(" ", strip=True) if title_el else "",
-                location=loc_el.get_text(" ", strip=True) if loc_el else "",
-                url=href,
-                price_inr=parse_price_to_inr(price_el.get_text() if price_el else ""),
-                price_display=price_el.get_text(" ", strip=True) if price_el else "",
-            ))
-        except Exception:
-            continue
-    log.info("SquareYards: %d raw listings", len(listings))
-    return listings
+            r = requests.get(api, headers={**COMMON_HEADERS, "Accept": "application/json", "Referer": "https://www.nobroker.in/"}, timeout=30)
+            if r.status_code != 200:
+                log.warning("NoBroker API %s", r.status_code)
+                continue
+            try:
+                data = r.json()
+            except Exception:
+                continue
+            items = data.get("data") or data.get("properties") or data.get("results") or []
+            for it in items:
+                try:
+                    price = it.get("price") or it.get("rent") or 0
+                    price_inr = int(price) if price else None
+                    if not price_inr or price_inr < MIN_PRICE_INR: continue
+                    loc = " ".join(filter(None, [it.get("societyName", ""), it.get("localityName", ""), it.get("locality", "")]))
+                    area = match_target_area(loc)
+                    if not area: continue
+                    lid = str(it.get("id") or it.get("propertyId") or "")
+                    out.append(Listing(
+                        site="NoBroker",
+                        listing_id=lid,
+                        title=it.get("title", "") or it.get("propertyTitle", ""),
+                        location=loc,
+                        url=f"https://www.nobroker.in/property/{lid}",
+                        price_inr=price_inr,
+                        price_display=format_inr(price_inr),
+                        bhk=str(it.get("type", "") or it.get("propertyType", "")),
+                        seller_name=str(it.get("ownerName") or it.get("postedBy") or ""),
+                        matched_area=area,
+                    ))
+                except Exception:
+                    continue
+            if out: break
+        except Exception as e:
+            log.warning("NoBroker error: %s", str(e)[:100])
+    log.info("NoBroker: %d matched", len(out))
+    return out
 
 
 def scrape_propertywala() -> list[Listing]:
-    """PropertyWala East Delhi for sale."""
-    listings: list[Listing] = []
-    url = "https://www.propertywala.com/property-for-sale-east_delhi"
-    r = fetch(url)
-    if not r:
-        return listings
+    """PropertyWala - try multiple URL patterns."""
+    out: list[Listing] = []
+    url_candidates = [
+        "https://www.propertywala.com/properties-for-sale/east-delhi",
+        "https://www.propertywala.com/property-for-sale-east_delhi",
+        "https://www.propertywala.com/east-delhi-property",
+    ]
+    r = None
+    for url in url_candidates:
+        r = fetch(url)
+        if r and r.status_code == 200 and len(r.text) > 3000:
+            log.info("PropertyWala: using %s", url[:80])
+            break
+    if not r or r.status_code != 200:
+        return out
+
     soup = BeautifulSoup(r.text, "html.parser")
-    for c in soup.select(".listing, .property-listing, .ad"):
+    for c in soup.select(".listing, .property-listing, .ad, article, [class*=property]"):
         try:
-            title_el = c.select_one("h2, h3, .title, a")
-            price_el = c.select_one(".price, [class*=price]")
+            txt = c.get_text(" ", strip=True) or ""
+            if len(txt) < 60 or "\u20b9" not in txt and "Rs" not in txt: continue
+            text = re.sub(r"\s+", " ", txt)
+            price_m = re.search(r"(?:\u20b9|Rs\.?)\s*([\d.,]+)\s*(Cr|Lac|Lakh|Crore)?", text, re.I)
+            if not price_m: continue
+            price_inr = parse_price_to_inr(price_m.group(0))
+            if not price_inr or price_inr < MIN_PRICE_INR: continue
+            area = match_target_area(text)
+            if not area: continue
             link = c.select_one("a[href]")
             href = link["href"] if link else url
-            if href.startswith("/"):
-                href = "https://www.propertywala.com" + href
-            listings.append(Listing(
+            if href.startswith("/"): href = "https://www.propertywala.com" + href
+            bhk_m = re.search(r"(\d+)\s*BHK", text, re.I)
+            out.append(Listing(
                 site="PropertyWala",
-                listing_id=href[-60:],
-                title=title_el.get_text(" ", strip=True) if title_el else "",
-                location=title_el.get_text(" ", strip=True) if title_el else "",
+                listing_id=href[-50:],
+                title=text[:100],
+                location=area,
                 url=href,
-                price_inr=parse_price_to_inr(price_el.get_text() if price_el else ""),
-                price_display=price_el.get_text(" ", strip=True) if price_el else "",
+                price_inr=price_inr,
+                price_display=price_m.group(0),
+                bhk=bhk_m.group(0) if bhk_m else "",
+                matched_area=area,
             ))
         except Exception:
             continue
-    log.info("PropertyWala: %d raw listings", len(listings))
-    return listings
+    log.info("PropertyWala: %d matched", len(out))
+    return out
 
 
 def scrape_dreamproperty() -> list[Listing]:
-    """Dream Property - small portal; best effort generic scrape."""
-    listings: list[Listing] = []
-    url = "https://www.dreamproperty.co.in/property-for-sale/east-delhi"
-    r = fetch(url)
-    if not r:
-        return listings
+    """DreamProperty - user specified dreamproperty.net.in in v2."""
+    out: list[Listing] = []
+    url_candidates = [
+        "https://dreamproperty.net.in/property-for-sale/east-delhi",
+        "https://dreamproperty.net.in/east-delhi",
+        "https://dreamproperty.net.in/",
+    ]
+    r = None
+    for url in url_candidates:
+        r = fetch(url)
+        if r and r.status_code == 200 and len(r.text) > 1000:
+            log.info("DreamProperty: using %s", url[:80])
+            break
+    if not r or r.status_code != 200:
+        return out
+
     soup = BeautifulSoup(r.text, "html.parser")
-    for c in soup.select(".property-box, .property-card, article"):
+    for c in soup.find_all(["article", "div"], class_=re.compile(r"property|card|listing|item", re.I)):
         try:
-            title_el = c.select_one("h2, h3, .title, a")
-            price_el = c.select_one(".price, [class*=price]")
+            txt = c.get_text(" ", strip=True) or ""
+            if len(txt) < 50 or len(txt) > 800: continue
+            text = re.sub(r"\s+", " ", txt)
+            price_m = re.search(r"(?:\u20b9|Rs\.?)\s*([\d.,]+)\s*(Cr|Lac|Lakh|Crore)?", text, re.I)
+            if not price_m: continue
+            price_inr = parse_price_to_inr(price_m.group(0))
+            if not price_inr or price_inr < MIN_PRICE_INR: continue
+            area = match_target_area(text)
+            if not area: continue
             link = c.select_one("a[href]")
             href = link["href"] if link else url
-            if href.startswith("/"):
-                href = "https://www.dreamproperty.co.in" + href
-            listings.append(Listing(
+            if href.startswith("/"): href = "https://dreamproperty.net.in" + href
+            bhk_m = re.search(r"(\d+)\s*BHK", text, re.I)
+            out.append(Listing(
                 site="DreamProperty",
-                listing_id=href[-60:],
-                title=title_el.get_text(" ", strip=True) if title_el else "",
-                location=title_el.get_text(" ", strip=True) if title_el else "",
+                listing_id=href[-50:],
+                title=text[:100],
+                location=area,
                 url=href,
-                price_inr=parse_price_to_inr(price_el.get_text() if price_el else ""),
-                price_display=price_el.get_text(" ", strip=True) if price_el else "",
+                price_inr=price_inr,
+                price_display=price_m.group(0),
+                bhk=bhk_m.group(0) if bhk_m else "",
+                matched_area=area,
             ))
         except Exception:
             continue
-    log.info("DreamProperty: %d raw listings", len(listings))
-    return listings
-
-
-def _parse_iso(s: str | None) -> datetime | None:
-    if not s:
-        return None
-    try:
-        return datetime.fromisoformat(s.replace("Z", "+00:00"))
-    except Exception:
-        try:
-            return datetime.strptime(s[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
-        except Exception:
-            return None
-
-
-# ---------------------------------------------------------------------------
-# PLAYWRIGHT FALLBACK
-# Only invoked if the simple fetch returned nothing useful for a given site.
-# ---------------------------------------------------------------------------
-
-def playwright_fetch(url: str, wait_selector: str | None = None) -> str | None:
-    """Render a URL with a real browser and return the HTML."""
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError:
-        log.warning("Playwright not installed; skipping browser fallback")
-        return None
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
-            ctx = browser.new_context(user_agent=COMMON_HEADERS["User-Agent"])
-            page = ctx.new_page()
-            page.goto(url, timeout=60_000, wait_until="domcontentloaded")
-            if wait_selector:
-                try:
-                    page.wait_for_selector(wait_selector, timeout=15_000)
-                except Exception:
-                    pass
-            page.wait_for_timeout(3_000)
-            html = page.content()
-            browser.close()
-            return html
-    except Exception as e:
-        log.warning("Playwright failed for %s: %s", url, e)
-        return None
+    log.info("DreamProperty: %d matched", len(out))
+    return out
 
 
 # ---------------------------------------------------------------------------
 # TELEGRAM
 # ---------------------------------------------------------------------------
 
-def telegram_send(text: str) -> None:
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        log.error("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID")
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    # Telegram hard limit is 4096 chars per message; split safely on newlines.
-    chunks = _chunk(text, 3800)
-    for i, chunk in enumerate(chunks):
-        try:
-            r = requests.post(url, data={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": chunk,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": True,
-            }, timeout=30)
-            if not r.ok:
-                log.error("Telegram send failed [%d/%d]: %s", i + 1, len(chunks), r.text)
-            else:
-                log.info("Telegram chunk %d/%d sent", i + 1, len(chunks))
-        except Exception as e:
-            log.error("Telegram exception: %s", e)
-        time.sleep(0.5)
-
-
 def _chunk(text: str, size: int) -> list[str]:
-    if len(text) <= size:
-        return [text]
-    out, current = [], ""
+    if len(text) <= size: return [text]
+    out, cur = [], ""
     for line in text.split("\n"):
-        if len(current) + len(line) + 1 > size:
-            out.append(current)
-            current = line
+        if len(cur) + len(line) + 1 > size:
+            out.append(cur); cur = line
         else:
-            current = f"{current}\n{line}" if current else line
-    if current:
-        out.append(current)
+            cur = f"{cur}\n{line}" if cur else line
+    if cur: out.append(cur)
     return out
 
 
+def telegram_send(text: str) -> None:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        log.error("Missing Telegram credentials"); return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    for i, chunk in enumerate(_chunk(text, 3800)):
+        try:
+            r = requests.post(url, data={
+                "chat_id": TELEGRAM_CHAT_ID, "text": chunk,
+                "parse_mode": "HTML", "disable_web_page_preview": True,
+            }, timeout=30)
+            if not r.ok: log.error("TG send failed [%d]: %s", i+1, r.text[:200])
+            else: log.info("TG chunk %d sent", i+1)
+        except Exception as e:
+            log.error("TG exception: %s", e)
+        time.sleep(0.4)
+
+
 # ---------------------------------------------------------------------------
-# SEEN-LISTING PERSISTENCE
+# SEEN PERSISTENCE
 # ---------------------------------------------------------------------------
 
 def load_seen() -> set[str]:
     if SEEN_FILE.exists():
-        try:
-            return set(json.loads(SEEN_FILE.read_text()))
-        except Exception:
-            pass
+        try: return set(json.loads(SEEN_FILE.read_text()))
+        except Exception: pass
     return set()
 
 
 def save_seen(seen: set[str]) -> None:
-    # Keep seen list bounded to the most-recent ~5000 to prevent unbounded growth.
-    arr = list(seen)[-5000:]
-    SEEN_FILE.write_text(json.dumps(arr))
+    SEEN_FILE.write_text(json.dumps(list(seen)[-5000:]))
 
 
 # ---------------------------------------------------------------------------
-# MAIN ORCHESTRATION
+# MAIN
 # ---------------------------------------------------------------------------
 
 SCRAPERS: list[tuple[str, Callable[[], list[Listing]]]] = [
-    ("MagicBricks",   scrape_magicbricks),
     ("99acres",       scrape_99acres),
+    ("MagicBricks",   scrape_magicbricks),
+    ("Housing",       scrape_housing),
     ("NoBroker",      scrape_nobroker),
-    ("SquareYards",   scrape_squareyards),
     ("PropertyWala",  scrape_propertywala),
     ("DreamProperty", scrape_dreamproperty),
 ]
@@ -613,81 +663,93 @@ SCRAPERS: list[tuple[str, Callable[[], list[Listing]]]] = [
 
 def run() -> int:
     started = datetime.now()
-    log.info("=== East Delhi Property Tracker starting at %s ===", started.isoformat())
+    log.info("=== Property Tracker v2 starting at %s ===", started.isoformat())
 
     all_raw: list[Listing] = []
-    per_site_counts: dict[str, int] = {}
+    per_site: dict[str, int] = {}
     errors: dict[str, str] = {}
 
     for name, fn in SCRAPERS:
         try:
             items = fn() or []
-            per_site_counts[name] = len(items)
+            per_site[name] = len(items)
             all_raw.extend(items)
         except Exception as e:
-            log.exception("Scraper %s failed: %s", name, e)
-            errors[name] = str(e)
-            per_site_counts[name] = 0
+            log.exception("%s failed: %s", name, e)
+            errors[name] = str(e)[:200]
+            per_site[name] = 0
 
-    log.info("Total raw listings collected: %d", len(all_raw))
+    log.info("Total raw: %d", len(all_raw))
 
-    # --- filter ---
+    # Filter with sliding window fallback to hit TARGET_MIN_LISTINGS
     seen = load_seen()
     matched: list[Listing] = []
-    for lst in all_raw:
-        area = match_target_area(f"{lst.title} {lst.location}")
-        if not area:
-            continue
-        if lst.price_inr is not None and lst.price_inr < MIN_PRICE_INR:
-            continue
-        if not within_window(lst.posted_at):
-            continue
-        key = lst.unique_key()
-        if key in seen:
-            continue
-        lst.matched_area = area
-        matched.append(lst)
-        seen.add(key)
+    used_window_h = FALLBACK_WINDOWS_H[0]
+    for window_h in FALLBACK_WINDOWS_H:
+        used_window_h = window_h
+        matched = []
+        tmp_seen = set(seen)
+        for lst in all_raw:
+            if lst.price_inr is None or lst.price_inr < MIN_PRICE_INR: continue
+            if not lst.matched_area: continue
+            if not within_window(lst.posted_at, window_h): continue
+            k = lst.unique_key()
+            if k in tmp_seen: continue
+            matched.append(lst); tmp_seen.add(k)
+        if len(matched) >= TARGET_MIN_LISTINGS:
+            break
+        log.info("Only %d in %dh window; widening...", len(matched), window_h)
 
+    # commit seen
+    for m in matched: seen.add(m.unique_key())
     save_seen(seen)
-    log.info("Matched after filter: %d", len(matched))
+    log.info("Matched: %d (window: %dh)", len(matched), used_window_h)
 
-    # --- compose Telegram message ---
+    # Compose digest
     today = datetime.now().strftime("%d %b %Y, %a")
-    header = f"<b>East Delhi Property Tracker</b>\n<i>{today} &#183; ₹1 Cr+ &#183; last {HOURS_WINDOW}h</i>\n\n"
+    window_label = {72: "last 72h", 168: "last 7 days", 720: "last 30 days"}.get(used_window_h, f"last {used_window_h}h")
+    header = (
+        f"<b>\ud83c\udfe0 East Delhi Property Tracker</b>\n"
+        f"<i>{today} \u00b7 \u20b95 Cr+ \u00b7 {window_label}</i>\n"
+        f"<i>49 target areas</i>\n\n"
+    )
 
     if not matched:
-        summary = "Aaj koi nayi matching listing nahi mili target 49 areas mein."
-        debug = "<code>" + " | ".join(f"{k}:{v}" for k, v in per_site_counts.items()) + "</code>"
-        telegram_send(header + summary + "\n\n<b>Site scan counts:</b>\n" + debug)
+        msg = (header +
+               "Aaj koi matching listing nahi mili 30-din window mein bhi.\n\n"
+               "<b>Site scan counts:</b>\n<code>" +
+               " | ".join(f"{k}:{v}" for k, v in per_site.items()) + "</code>")
+        telegram_send(msg)
         return 0
 
-    body_lines = [header, f"✅ <b>{len(matched)} naye listings</b>\n"]
-    by_area: dict[str, list[Listing]] = {}
-    for m in matched[:MAX_LISTINGS_PER_MESSAGE]:
-        by_area.setdefault(m.matched_area, []).append(m)
+    lines = [header, f"\u2705 <b>{len(matched)} listings</b>\n"]
+    for i, m in enumerate(matched[:MAX_LISTINGS_PER_MESSAGE], 1):
+        price = m.price_display or format_inr(m.price_inr or 0)
+        bhk = f" \u00b7 {m.bhk}" if m.bhk else ""
+        seller = m.seller_name or "<i>Not listed</i>"
+        phone = m.seller_phone or "<i>Login required on site</i>"
+        title = (m.title or "Property").replace("<", "").replace(">", "")[:100]
+        url = m.url.replace("<", "").replace(">", "")[:250]
+        lines.append(
+            f"<b>{i}.</b> \ud83d\udccd <b>{m.matched_area}</b>{bhk} \u00b7 <i>{m.site}</i>\n"
+            f"   \ud83d\udcb0 <b>{price}</b>\n"
+            f"   \ud83c\udfe2 {title[:80]}\n"
+            f"   \ud83d\udc64 Seller: {seller}\n"
+            f"   \ud83d\udcde Phone: {phone}\n"
+            f"   \ud83d\udd17 <a href=\"{url}\">View listing</a>\n"
+        )\n\n    if len(matched) > MAX_LISTINGS_PER_MESSAGE:
+        lines.append(f"<i>\u2026 +{len(matched) - MAX_LISTINGS_PER_MESSAGE} more trimmed</i>\n")
 
-    for area, items in sorted(by_area.items()):
-        body_lines.append(f"\n📍 <b>{area}</b> ({len(items)})")
-        for it in items:
-            price = it.price_display or (format_inr(it.price_inr) if it.price_inr else "Price on request")
-            bhk = f" &#183; {it.bhk}BHK" if it.bhk and str(it.bhk).strip() and str(it.bhk) != "0" else ""
-            title = (it.title or "Property")[:80]
-            line = (
-                f"&#183; <a href=\"{it.url}\">{title}</a>{bhk}\n"
-                f"   💰 {price} &#183; <i>{it.site}</i>"
-            )
-            body_lines.append(line)
-
-    if len(matched) > MAX_LISTINGS_PER_MESSAGE:
-        body_lines.append(f"\n<i>+ {len(matched) - MAX_LISTINGS_PER_MESSAGE} more listings trimmed</i>")
-
-    body_lines.append("\n<b>Site scan counts:</b>")
-    body_lines.append("<code>" + " | ".join(f"{k}:{v}" for k, v in per_site_counts.items()) + "</code>")
+    lines.append(
+        "\n<b>\u2139\ufe0f Phone note:</b> <i>Property sites login-gate seller phones. "
+        "Listing par click karke 'View Number' se milega.</i>\n"
+    )
+    lines.append("<b>Site scan counts:</b>")
+    lines.append("<code>" + " | ".join(f"{k}:{v}" for k, v in per_site.items()) + "</code>")
     if errors:
-        body_lines.append("<b>⚠️ Errors:</b> " + ", ".join(errors.keys()))
+        lines.append("<b>\u26a0\ufe0f Errors:</b> " + ", ".join(errors.keys()))
 
-    telegram_send("\n".join(body_lines))
+    telegram_send("\n".join(lines))
     log.info("=== Done in %.1fs ===", (datetime.now() - started).total_seconds())
     return 0
 
