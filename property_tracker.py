@@ -18,6 +18,7 @@ Changes in v2:
 
 from __future__ import annotations
 
+import html as _html
 import json
 import logging
 import os
@@ -626,7 +627,9 @@ def telegram_send(text: str) -> None:
                 "chat_id": TELEGRAM_CHAT_ID, "text": chunk,
                 "parse_mode": "HTML", "disable_web_page_preview": True,
             }, timeout=30)
-            if not r.ok: log.error("TG send failed [%d]: %s", i+1, r.text[:200])
+            if not r.ok:
+                log.error("TG send failed [%d]: %s", i+1, r.text[:500])
+                raise RuntimeError(f"Telegram API rejected: {r.text[:300]}")
             else: log.info("TG chunk %d sent", i+1)
         except Exception as e:
             log.error("TG exception: %s", e)
@@ -725,14 +728,14 @@ def run() -> int:
 
     lines = [header, f"\u2705 <b>{len(matched)} listings</b>\n"]
     for i, m in enumerate(matched[:MAX_LISTINGS_PER_MESSAGE], 1):
-        price = m.price_display or format_inr(m.price_inr or 0)
-        bhk = f" \u00b7 {m.bhk}" if m.bhk else ""
-        seller = m.seller_name or "<i>Not listed</i>"
-        phone = m.seller_phone or "<i>Login required on site</i>"
-        title = (m.title or "Property").replace("<", "").replace(">", "")[:100]
-        url = m.url.replace("<", "").replace(">", "")[:250]
+        price = _html.escape(m.price_display or format_inr(m.price_inr or 0))
+        bhk = f" \u00b7 {_html.escape(m.bhk)}" if m.bhk else ""
+        seller = _html.escape(m.seller_name) if m.seller_name else "<i>Not listed</i>"
+        phone = _html.escape(m.seller_phone) if m.seller_phone else "<i>Login required on site</i>"
+        title = _html.escape((m.title or "Property")[:100])
+        url = _html.escape(m.url[:250], quote=True)
         lines.append(
-            f"<b>{i}.</b> \ud83d\udccd <b>{m.matched_area}</b>{bhk} \u00b7 <i>{m.site}</i>\n"
+            f"<b>{i}.</b> \ud83d\udccd <b>{_html.escape(m.matched_area)}</b>{bhk} \u00b7 <i>{_html.escape(m.site)}</i>\n"
             f"   \ud83d\udcb0 <b>{price}</b>\n"
             f"   \ud83c\udfe2 {title[:80]}\n"
             f"   \ud83d\udc64 Seller: {seller}\n"
