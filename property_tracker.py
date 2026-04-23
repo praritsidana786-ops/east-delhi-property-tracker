@@ -220,6 +220,38 @@ def fetch(url: str, headers: dict | None = None, timeout: int = 30) -> requests.
         time.sleep(1.5 * (attempt + 1))
     return None
 
+def playwright_fetch(url: str, wait_selector: str | None = None) -> str | None:
+    """Render a URL with a headless Chromium browser. Returns HTML on success, None on failure."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        log.warning("Playwright not installed; skipping browser fallback")
+        return None
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-blink-features=AutomationControlled"])
+            ctx = browser.new_context(
+                user_agent=COMMON_HEADERS["User-Agent"],
+                viewport={"width": 1366, "height": 900},
+                locale="en-IN",
+            )
+            page = ctx.new_page()
+            page.goto(url, timeout=45_000, wait_until="domcontentloaded")
+            if wait_selector:
+                try:
+                    page.wait_for_selector(wait_selector, timeout=12_000)
+                except Exception:
+                    pass
+            for _ in range(3):
+                page.evaluate("window.scrollBy(0, 1500)")
+                page.wait_for_timeout(500)
+            html = page.content()
+            browser.close()
+            return html
+    except Exception as e:
+        log.warning("Playwright failed for %s: %s", url[:80], str(e)[:150])
+        return None
+
 
 # ---------------------------------------------------------------------------
 # SITE SCRAPERS
